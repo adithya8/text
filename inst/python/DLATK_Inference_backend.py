@@ -324,3 +324,141 @@ def predict_regression_values(
 
     return predictions_dict
 
+def load_reducer_model(pickle_path: str) -> Dict:
+    """
+    Load and validate a DLATK dimension-reducer pickle for inference.
+
+    Expected keys in the pickle:
+      - "clusterModels" : dict of reducer objects keyed by outcome (or "noOutcome")
+      - "scalers"       : dict of scalers (may be empty)
+      - "fSelectors"    : dict of feature selectors (may be empty)
+      - "featureNames"  : list of feature names in model order
+
+    This function does not mutate the loaded dict.
+
+    Args:
+        pickle_path: Path to the reducer pickle file.
+
+    Returns:
+        The unmodified dict loaded from the pickle.
+
+    Raises:
+        ValueError: If required keys are missing or if the model uses multiX/controls.
+    """
+    with open(pickle_path, "rb") as f:
+        model_dict = pickle.load(f)
+
+    required = ["clusterModels", "featureNames"]
+    for k in required:
+        if k not in model_dict:
+            raise ValueError(f"Missing required key '{k}' in reducer pickle.")
+
+    # Reject unsupported multiX/controls
+    if model_dict.get("multiXOn"):
+        raise ValueError("Reducer model uses multiX (multiXOn=True) which is not supported by this backend.")
+    if "controlsOrder" in model_dict:
+        raise ValueError("Reducer model contains controls (controlsOrder) which is not supported by this backend.")
+
+    return model_dict
+
+
+def apply_dimension_reducer(
+    X: Union[List[List[float]], np.ndarray],
+    feature_names: List[str],
+    pickle_path: str,
+    outcomes: Union[List[str], str] = None,
+) -> Dict[str, Dict]:
+    """
+    Apply a saved DLATK dimension reducer to input data.
+
+    Behavior / assumptions:
+      - Dense input only (list-of-lists or numpy array).
+      - feature_names must match the model's featureNames as a set; order may differ.
+      - For each requested outcome (or all), the function:
+          * reorders X to model order,
+          * applies scaler.transform and fSelector.transform if present,
+          * calls cluster.transform(X_proc) if available, else cluster.predict(X_proc).
+          * If returned array is 1D, it is reshaped to (n_samples, 1).
+      - Component names are derived from cluster.components_ or cluster.n_components_ when available,
+        otherwise generated as COMPONENT_0..COMPONENT_{k-1}.
+
+    Args:
+        X: samples x features as list-of-lists or numpy array.
+        feature_names: names of columns in X (order may differ).
+        pickle_path: path to reducer pickle containing 'clusterModels'.
+        outcomes: None (run all), a string (single outcome), or a list of outcome names.
+
+    Returns:
+        Dict mapping outcome name -> dict with keys:
+            - "components": list-of-lists (n_samples x n_components)
+            - "component_names": list of str
+
+    Raises:
+        ValueError: For feature mismatches, unknown outcomes, unsupported models, or if reducer
+                    returns unexpected shapes.
+    """
+    model = load_reducer_model(pickle_path)
+    model_feature_names = model["featureNames"]
+    X_aligned = _align_and_validate_X(X, feature_names, model_feature_names)
+
+    all_outcomes = list(model["clusterModels"].keys())
+    outcomes_to_run = _normalize_outcomes_arg(outcomes, all_outcomes)
+
+    missing = [o for o in outcomes_to_run if o not in all_outcomes]
+    if missing:
+        raise ValueError(f"Outcome(s) not found in reducer model: {missing}")
+
+    results: Dict[str, Dict] = {}
+    for out in outcomes_to_run:
+        cluster = model["clusterModels"][out]
+        scaler = model.get("scalers", {}).get(out) or None
+        fselector = model.get("fSelectors", {}).get(out) or None
+
+        X_proc = X_aligned
+        if scaler is not None:
+            X_proc = scaler.transform(X_proc)
+        if fselector is not None:
+            X_proc = fselector.transform(X_proc)
+
+        # Prefer transform, but fall back to predict if transform not present.
+        if hasattr(cluster, "transform"):
+            comp = cluster.transform(X_proc)
+        elif hasattr(cluster, "predict"):
+            comp = cluster.predict(X_proc)
+        else:
+            raise ValueError(f"Reducer for outcome '{out}' has no transform/predict methods for inference.")
+
+        comp = np.asarray(comp)
+        if comp.ndim == 1:
+            comp = comp.reshape(-1, 1)
+
+        # Determine number of components and names
+        n_comp = None
+        comp_names: List[str] = []
+        try:
+            # cluster.components_ shaped (n_components, n_features) for many reducers
+            if hasattr(cluster, "components_"):
+                n_comp = int(getattr(cluster, "components_").shape[0])
+        except Exception:
+            n_comp = None
+
+        if n_comp is None and hasattr(cluster, "n_components_"):
+            try:
+                n_comp = int(getattr(cluster, "n_components_"))
+            except Exception:
+                n_comp = None
+
+        if n_comp is None:
+            # fallback to produced array width
+            n_comp = comp.shape[1] if comp.ndim == 2 else 1
+
+        comp_names = [f"COMPONENT_{i}" for i in range(n_comp)]
+
+        # If comp has more columns than n_comp inferred, adjust names to match actual columns
+        if comp.shape[1] != n_comp:
+            comp_names = [f"COMPONENT_{i}" for i in range(comp.shape[1])]
+
+        results[out] = {"components": comp.tolist(), "component_names": comp_names}
+
+    return results
+
